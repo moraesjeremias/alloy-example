@@ -1,0 +1,9 @@
+[package]
+name = "alloy-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "1.0.26", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full", "macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.19", features = ["json"] }
