@@ -1,15 +1,13 @@
-use std::{env, ops::Mul, time::Duration};
+use std::{
+    env,
+    ops::{Div, Mul},
+    time::Duration,
+};
 
 use alloy::{
-    network::{Ethereum, EthereumWallet, TransactionBuilder},
+    network::{Ethereum, TransactionBuilder},
     primitives::{Address, U256, utils::Unit},
-    providers::{
-        Identity, Provider, ProviderBuilder, RootProvider,
-        fillers::{
-            BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-            WalletFiller,
-        },
-    },
+    providers::{Provider, ProviderBuilder},
     rpc::types::TransactionRequest,
     signers::local::PrivateKeySigner,
 };
@@ -18,9 +16,10 @@ use dotenv::dotenv;
 use tokio::time::{Instant, sleep_until};
 use tracing::info;
 
-use crate::logs::initialize_logger;
+use crate::{logs::initialize_logger, types::CoingekoApiResponse};
 
 mod logs;
+mod types;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,8 +39,8 @@ async fn handle_proc() -> Result<()> {
         .connect(rpc_url.as_str())
         .await?;
 
-    let max_gas_fee_threshold: u128 = env::var("MAX_GAS_FEE_THRESHOLD")
-        .unwrap_or("1000000000".to_string())
+    let max_gas_fee_threshold: f64 = env::var("MAX_GAS_FEE_THRESHOLD")
+        .unwrap_or("0.01".to_string())
         .parse()?;
 
     let to_address: Address = env::var("TO_ADDRESS").unwrap_or("".to_string()).parse()?;
@@ -79,37 +78,63 @@ where
     info!("Pending tx {}", pending_tx.tx_hash());
 
     let receipt = pending_tx.get_receipt().await?;
-    let gas_used: u128 = receipt.gas_used as u128;
 
-    let effective_gas = gas_used.mul(receipt.effective_gas_price);
+    let wei: f64 = Unit::ETHER.wei_const().to::<u64>() as f64;
+
+    let gas_price: f64 = receipt.effective_gas_price as f64;
+    let effective_gas_used = gas_price.mul(receipt.gas_used as f64).div(wei);
+
+    let usd_fee = convert_gas_fee(effective_gas_used).await;
 
     info!(
         message = "Transaction gas fee used",
-        gas_fee = effective_gas,
+        gas_fee = effective_gas_used,
+        usd_fee = usd_fee,
         tx_hash = %receipt.transaction_hash,
     );
 
     return Ok(());
 }
 
-async fn estimate_effective_gas<P>(provider: &P, tx_request: &TransactionRequest) -> u128
+async fn estimate_effective_gas<P>(provider: &P, tx_request: &TransactionRequest) -> f64
 where
     P: Provider<Ethereum>,
 {
-    let gas_estimate = provider.estimate_gas(tx_request.clone()).await.unwrap() as u128;
+    let wei = Unit::ETHER.wei_const().to::<u64>() as f64;
+    let gas_estimate = provider.estimate_gas(tx_request.clone()).await.unwrap() as f64;
 
     let max_fee_per_gas = provider
         .estimate_eip1559_fees()
         .await
         .unwrap()
-        .max_fee_per_gas;
-    let effective_gas_estimate = gas_estimate.mul(max_fee_per_gas);
+        .max_fee_per_gas as f64;
+    let effective_gas_estimate = gas_estimate.mul(max_fee_per_gas).div(wei);
+    let usd_estimate = convert_gas_fee(effective_gas_estimate).await;
     info!(
         message = "Gas estimate",
         gas_estimate = gas_estimate,
         effective_gas_estimate = effective_gas_estimate,
-        max_fee_per_gas = max_fee_per_gas
+        max_fee_per_gas = max_fee_per_gas,
+        usd_estimate = usd_estimate
     );
 
     return effective_gas_estimate;
+}
+
+pub async fn fetch_eth_to_usd_rate() -> CoingekoApiResponse {
+    let coingeko_url =
+        env::var("COINGEKO_URL").unwrap_or("https://api.coingecko.com/api".to_string());
+    let coingeko_api_key = env::var("COINGEKO_API_KEY").expect("Missing COINGEKO_API_KEY env");
+    let price_endpoint = format!(
+        "{}/v3/simple/price?ids={}&vs_currencies={}&x_cg_api_key={}",
+        coingeko_url, "ethereum", "usd", coingeko_api_key
+    );
+    let response = reqwest::get(price_endpoint).await.unwrap();
+
+    response.json::<CoingekoApiResponse>().await.unwrap()
+}
+
+pub async fn convert_gas_fee(gas_fee: f64) -> f64 {
+    let eth_to_usd_rate = fetch_eth_to_usd_rate().await;
+    return gas_fee.mul(eth_to_usd_rate.from_asset.to_asset);
 }
